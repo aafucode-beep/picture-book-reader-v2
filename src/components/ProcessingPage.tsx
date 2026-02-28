@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { analyzeImages, synthesizeSpeech, saveBook } from '../api';
+import { useState, useEffect, useRef } from 'react';
+import { analyzeSingleImage, synthesizeSpeech, saveBook } from '../api';
 import { Page, AudioUrls } from '../types';
 
 interface ProcessingPageProps {
@@ -8,227 +8,186 @@ interface ProcessingPageProps {
   onCancel: () => void;
 }
 
-type Step = 'analyzing' | 'synthesizing' | 'saving' | 'complete';
-type StepStatus = 'pending' | 'active' | 'complete' | 'error';
-
-interface StepInfo {
-  key: Step;
-  label: string;
-  status: StepStatus;
-}
+type MainStep = 'analyzing' | 'synthesizing' | 'saving' | 'complete' | 'error';
 
 export default function ProcessingPage({ pages: initialPages, onComplete, onCancel }: ProcessingPageProps) {
   const [images, setImages] = useState<string[]>([]);
   const [bookId] = useState(() => `book_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`);
-  const [pages, setPages] = useState<Page[]>(initialPages);
+  const [pages, setPages] = useState<Page[]>([]);
   const [audioUrls, setAudioUrls] = useState<AudioUrls[]>([]);
-  const [currentStep, setCurrentStep] = useState<Step>('analyzing');
+  const [mainStep, setMainStep] = useState<MainStep>('analyzing');
   const [error, setError] = useState('');
   const [bookTitle, setBookTitle] = useState('');
+  const [analyzedCount, setAnalyzedCount] = useState(0);
+  const [totalImages, setTotalImages] = useState(0);
+  const didRun = useRef(false);
 
   useEffect(() => {
-    // Get images from sessionStorage
     const storedImages = sessionStorage.getItem('uploaded_images');
     if (storedImages) {
       try {
         const parsed = JSON.parse(storedImages);
         setImages(parsed);
+        setTotalImages(parsed.length);
       } catch (e) {
         console.error('Failed to parse stored images');
       }
     }
-
-    // Get book title
     const storedTitle = sessionStorage.getItem('book_title');
-    if (storedTitle) {
-      setBookTitle(storedTitle);
-    }
+    if (storedTitle) setBookTitle(storedTitle);
   }, []);
 
-  const runAnalysis = async (): Promise<Page[]> => {
-    setCurrentStep('analyzing');
-    const storedImages = sessionStorage.getItem('uploaded_images');
-    if (!storedImages) throw new Error('No images found');
-
-    const parsedImages = JSON.parse(storedImages);
-    const response = await analyzeImages(parsedImages);
-
-    if (!response.success) {
-      throw new Error(response.error || 'Analysis failed');
-    }
-
-    return response.pages;
-  };
-
-  const runSynthesis = async (analyzedPages: Page[]): Promise<AudioUrls[]> => {
-    setCurrentStep('synthesizing');
-    const response = await synthesizeSpeech(analyzedPages, {}, bookId);
-
-    if (!response.success) {
-      throw new Error(response.error || 'Synthesis failed');
-    }
-
-    return response.audio_urls;
-  };
-
-  const runSave = async (analyzedPages: Page[], synthesizedAudioUrls: AudioUrls[]) => {
-    setCurrentStep('saving');
-    const title = bookTitle || `绘本 ${new Date().toLocaleDateString()}`;
-
-    const response = await saveBook(bookId, title, analyzedPages, synthesizedAudioUrls, images[0] || '');
-
-    if (!response.success) {
-      throw new Error(response.error || 'Save failed');
-    }
-
-    return response.book_id;
-  };
-
   useEffect(() => {
-    let mounted = true;
+    if (images.length === 0 || didRun.current) return;
+    didRun.current = true;
 
     const process = async () => {
       try {
-        // Step 1: Analyze images
-        const analyzedPages = await runAnalysis();
-        if (!mounted) return;
-        setPages(analyzedPages);
+        // Step 1: Analyze each image one by one
+        setMainStep('analyzing');
+        const analyzedPages: Page[] = [];
 
-        // Step 2: Synthesize speech
-        const synthesizedAudioUrls = await runSynthesis(analyzedPages);
-        if (!mounted) return;
-        setAudioUrls(synthesizedAudioUrls);
+        for (let i = 0; i < images.length; i++) {
+          const result = await analyzeSingleImage(images[i], i);
+          if (!result.success) throw new Error(result.error || `第${i+1}页分析失败`);
+          analyzedPages.push(result.page);
+          setAnalyzedCount(i + 1);
+          setPages([...analyzedPages]);
+        }
+
+        // Step 2: Synthesize speech (all pages at once)
+        setMainStep('synthesizing');
+        const synthResponse = await synthesizeSpeech(analyzedPages, {}, bookId);
+        if (!synthResponse.success) throw new Error(synthResponse.error || '语音生成失败');
+        setAudioUrls(synthResponse.audio_urls);
 
         // Step 3: Save book
-        const savedBookId = await runSave(analyzedPages, synthesizedAudioUrls);
-        if (!mounted) return;
+        setMainStep('saving');
+        const title = bookTitle || `绘本 ${new Date().toLocaleDateString()}`;
+        const saveResponse = await saveBook(bookId, title, analyzedPages, synthResponse.audio_urls, images[0] || '');
+        if (!saveResponse.success) throw new Error(saveResponse.error || '保存失败');
 
-        // Complete!
-        setCurrentStep('complete');
-
-        // Clear session storage
+        // Done!
+        setMainStep('complete');
         sessionStorage.removeItem('uploaded_images');
         sessionStorage.removeItem('book_title');
 
-        // Navigate to player
         setTimeout(() => {
-          onComplete(savedBookId, analyzedPages, synthesizedAudioUrls, bookTitle || `绘本`);
+          onComplete(saveResponse.book_id || bookId, analyzedPages, synthResponse.audio_urls, title);
         }, 1000);
 
       } catch (err: any) {
-        if (mounted) {
-          setError(err.message || 'Processing failed');
-          setCurrentStep('error' as Step);
-        }
+        console.error('Processing error:', err);
+        setError(err.message || '处理失败，请重试');
+        setMainStep('error');
       }
     };
 
-    if (images.length > 0 || initialPages.length > 0) {
-      process();
-    }
+    process();
+  }, [images]);
 
-    return () => {
-      mounted = false;
-    };
-  }, []);
+  const stepOrder: MainStep[] = ['analyzing', 'synthesizing', 'saving'];
 
-  const steps: StepInfo[] = [
-    { key: 'analyzing', label: '分析图片', status: currentStep === 'analyzing' ? 'active' : currentStep === 'analyzing' ? 'active' : ['synthesizing', 'saving', 'complete'].includes(currentStep) ? 'complete' : 'pending' },
-    { key: 'synthesizing', label: '生成语音', status: currentStep === 'synthesizing' ? 'active' : ['saving', 'complete'].includes(currentStep) ? 'complete' : currentStep === 'analyzing' ? 'pending' : 'pending' },
-    { key: 'saving', label: '保存书籍', status: currentStep === 'saving' ? 'active' : currentStep === 'complete' ? 'complete' : 'pending' },
+  const getStepStatus = (step: MainStep) => {
+    const idx = stepOrder.indexOf(step);
+    const curIdx = stepOrder.indexOf(mainStep);
+    if (mainStep === 'complete') return 'complete';
+    if (idx < curIdx) return 'complete';
+    if (idx === curIdx) return 'active';
+    return 'pending';
+  };
+
+  const steps = [
+    { key: 'analyzing' as MainStep, label: '分析图片' },
+    { key: 'synthesizing' as MainStep, label: '生成语音' },
+    { key: 'saving' as MainStep, label: '保存书籍' },
   ];
 
   return (
     <div className="h-full flex flex-col p-4">
-      {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-xl font-bold text-white">创建绘本</h1>
-        <button
-          onClick={onCancel}
-          className="text-sm text-gray-400 hover:text-white transition-colors"
-        >
+        <button onClick={onCancel} className="text-sm text-gray-400 hover:text-white transition-colors">
           取消
         </button>
       </div>
 
-      {/* Progress */}
       <div className="flex-1 flex flex-col items-center justify-center">
-        {/* Steps indicator */}
+        {/* Steps */}
         <div className="w-full max-w-xs mb-8">
-          {steps.map((step, index) => (
-            <div key={step.key} className="flex items-center mb-4">
-              <div
-                className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium ${
-                  step.status === 'active'
-                    ? 'bg-accent-500 text-white pulse'
-                    : step.status === 'complete'
-                    ? 'bg-green-500 text-white'
-                    : step.status === 'error'
-                    ? 'bg-red-500 text-white'
-                    : 'bg-dark-700 text-gray-400'
-                }`}
-              >
-                {step.status === 'complete' ? '✓' : step.status === 'error' ? '✕' : index + 1}
+          {steps.map((step, index) => {
+            const status = mainStep === 'error' && getStepStatus(step.key) === 'active' ? 'error' : getStepStatus(step.key);
+            return (
+              <div key={step.key} className="flex items-center mb-4">
+                <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium flex-shrink-0 ${
+                  status === 'active' ? 'bg-purple-500 text-white animate-pulse' :
+                  status === 'complete' ? 'bg-green-500 text-white' :
+                  status === 'error' ? 'bg-red-500 text-white' :
+                  'bg-gray-700 text-gray-400'
+                }`}>
+                  {status === 'complete' ? '✓' : status === 'error' ? '✕' : index + 1}
+                </div>
+                <span className={`ml-3 text-sm ${
+                  status === 'active' ? 'text-white' :
+                  status === 'complete' ? 'text-green-400' :
+                  status === 'error' ? 'text-red-400' :
+                  'text-gray-500'
+                }`}>
+                  {step.label}
+                </span>
               </div>
-              <span
-                className={`ml-3 text-sm ${
-                  step.status === 'active'
-                    ? 'text-white'
-                    : step.status === 'complete'
-                    ? 'text-green-400'
-                    : step.status === 'error'
-                    ? 'text-red-400'
-                    : 'text-gray-500'
-                }`}
-              >
-                {step.label}
-              </span>
-              {index < steps.length - 1 && (
-                <div
-                  className={`flex-1 h-0.5 ml-3 ${
-                    step.status === 'complete' ? 'bg-green-500' : 'bg-dark-700'
-                  }`}
-                />
-              )}
-            </div>
-          ))}
+            );
+          })}
         </div>
 
-        {/* Current step detail */}
-        <div className="text-center">
-          {currentStep === 'analyzing' && (
+        {/* Detail */}
+        <div className="text-center w-full max-w-xs">
+          {mainStep === 'analyzing' && (
             <div className="text-gray-300">
-              <p className="text-lg mb-2">正在分析绘本图片...</p>
-              <p className="text-sm text-gray-500">提取文字和对话内容</p>
+              <p className="text-lg mb-2">正在分析图片...</p>
+              {totalImages > 0 && (
+                <>
+                  <p className="text-sm text-gray-500 mb-3">
+                    第 {analyzedCount} / {totalImages} 页
+                  </p>
+                  <div className="w-full bg-gray-700 rounded-full h-2">
+                    <div
+                      className="bg-purple-500 h-2 rounded-full transition-all duration-500"
+                      style={{ width: `${totalImages > 0 ? (analyzedCount / totalImages) * 100 : 0}%` }}
+                    />
+                  </div>
+                </>
+              )}
             </div>
           )}
-          {currentStep === 'synthesizing' && (
+          {mainStep === 'synthesizing' && (
             <div className="text-gray-300">
               <p className="text-lg mb-2">正在生成语音...</p>
               <p className="text-sm text-gray-500">为每个角色合成声音</p>
             </div>
           )}
-          {currentStep === 'saving' && (
+          {mainStep === 'saving' && (
             <div className="text-gray-300">
               <p className="text-lg mb-2">正在保存...</p>
               <p className="text-sm text-gray-500">上传到云端</p>
             </div>
           )}
-          {currentStep === 'complete' && (
+          {mainStep === 'complete' && (
             <div className="text-green-400">
-              <p className="text-lg mb-2">完成!</p>
+              <p className="text-2xl mb-2">🎉</p>
+              <p className="text-lg mb-1">完成!</p>
               <p className="text-sm text-gray-500">即将进入阅读模式...</p>
             </div>
           )}
-          {currentStep === 'error' && (
+          {mainStep === 'error' && (
             <div className="text-red-400">
               <p className="text-lg mb-2">处理失败</p>
-              <p className="text-sm text-gray-500">{error}</p>
+              <p className="text-sm text-gray-400 mb-4 break-all">{error}</p>
               <button
                 onClick={onCancel}
-                className="mt-4 px-4 py-2 bg-dark-700 hover:bg-dark-600 rounded-lg text-white text-sm"
+                className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-white text-sm"
               >
-                返回
+                返回重试
               </button>
             </div>
           )}
