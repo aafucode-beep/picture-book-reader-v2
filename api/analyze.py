@@ -1,26 +1,22 @@
 """
-Vercel Serverless Function: Analyze picture book images using MiniMax vision API.
+Vercel Serverless Function: Analyze ONE picture book page using MiniMax vision API.
+Accepts a single image per call to stay within Vercel's 10s function timeout.
 """
 import os
 import sys
 import json
-import base64
 import httpx
 from http.server import BaseHTTPRequestHandler
 
 
-def encode_image_to_base64(image_bytes: bytes) -> str:
-    return base64.b64encode(image_bytes).decode('utf-8')
-
-
-def analyze_page_sync(image_b64: str, page_num: int) -> dict:
+def analyze_page_sync(image_b64: str, page_num: int, media_type: str = "image/jpeg") -> dict:
     api_key = os.environ.get('MINIMAX_API_KEY', '')
     base_url = os.environ.get('MINIMAX_BASE_URL', 'https://api.minimaxi.com/anthropic')
     model = os.environ.get('MINIMAX_MODEL', 'MiniMax-M2.5')
 
     prompt = f"""请分析这张绘本图片（第{page_num + 1}页），用中文返回以下JSON格式：
 {{
-    "narrator": "旁白文字（描述场景的主要故事文字）",
+    "narrator": "旁白文字（描述场景的主要故事文字，如果没有文字则根据画面编写）",
     "dialogues": [
         {{
             "character": "角色名称",
@@ -40,7 +36,7 @@ def analyze_page_sync(image_b64: str, page_num: int) -> dict:
                     "type": "image",
                     "source": {
                         "type": "base64",
-                        "media_type": "image/jpeg",
+                        "media_type": media_type,
                         "data": image_b64
                     }
                 },
@@ -52,7 +48,7 @@ def analyze_page_sync(image_b64: str, page_num: int) -> dict:
         }
     ]
 
-    with httpx.Client(timeout=120.0) as client:
+    with httpx.Client(timeout=25.0) as client:
         response = client.post(
             f"{base_url}/v1/messages",
             headers={
@@ -62,7 +58,7 @@ def analyze_page_sync(image_b64: str, page_num: int) -> dict:
             },
             json={
                 "model": model,
-                "max_tokens": 2000,
+                "max_tokens": 1000,
                 "messages": messages
             }
         )
@@ -70,11 +66,12 @@ def analyze_page_sync(image_b64: str, page_num: int) -> dict:
     print(f"[analyze] page {page_num}: status={response.status_code}", file=sys.stderr)
 
     if response.status_code != 200:
-        print(f"[analyze] error: {response.text[:300]}", file=sys.stderr)
+        err_text = response.text[:300]
+        print(f"[analyze] error: {err_text}", file=sys.stderr)
         return {
-            "narrator": f"第{page_num+1}页",
+            "narrator": f"第{page_num+1}页（分析失败）",
             "dialogues": [],
-            "scene_description": f"API错误: {response.status_code}"
+            "scene_description": f"API错误: {response.status_code} - {err_text[:100]}"
         }
 
     result = response.json()
@@ -86,12 +83,12 @@ def analyze_page_sync(image_b64: str, page_num: int) -> dict:
         if start >= 0 and end > start:
             return json.loads(content[start:end])
     except Exception as e:
-        print(f"[analyze] JSON parse error: {e}", file=sys.stderr)
+        print(f"[analyze] JSON parse error: {e}, raw: {content[:200]}", file=sys.stderr)
 
     return {
-        "narrator": content[:500],
+        "narrator": content[:500] if content else f"第{page_num+1}页",
         "dialogues": [],
-        "scene_description": "解析失败"
+        "scene_description": "解析完成"
     }
 
 
@@ -108,31 +105,38 @@ class handler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length)
             data = json.loads(body)
-            images = data.get('images', [])
 
-            if not images:
-                self._send_json(400, {"error": "No images provided", "success": False})
+            # Accept single image (new) or array (legacy)
+            image_data = data.get('image') or (data.get('images') or [None])[0]
+            page_num = data.get('page_num', 0)
+
+            if not image_data:
+                self._send_json(400, {"error": "No image provided", "success": False})
                 return
 
-            pages = []
-            for i, image_data in enumerate(images):
-                # Strip data URL prefix if present
-                if ',' in image_data:
-                    b64_data = image_data.split(',', 1)[1]
-                else:
-                    b64_data = image_data
+            # Detect media type from data URL
+            media_type = "image/jpeg"
+            if image_data.startswith('data:'):
+                header, image_data = image_data.split(',', 1)
+                if 'png' in header:
+                    media_type = "image/png"
+                elif 'webp' in header:
+                    media_type = "image/webp"
+            elif ',' in image_data:
+                image_data = image_data.split(',', 1)[1]
 
-                page = analyze_page_sync(b64_data, i)
-                pages.append(page)
+            page = analyze_page_sync(image_data, page_num, media_type)
 
             self._send_json(200, {
                 "success": True,
-                "pages": pages,
-                "page_count": len(pages)
+                "page": page,
+                "page_num": page_num
             })
 
         except Exception as e:
             print(f"[analyze] handler error: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             self._send_json(500, {"error": str(e), "success": False})
 
     def _send_json(self, status, data):
