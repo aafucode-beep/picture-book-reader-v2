@@ -2,52 +2,35 @@
 Vercel Serverless Function: Analyze picture book images using MiniMax vision API.
 """
 import os
+import sys
 import json
 import base64
 import httpx
-from typing import Any
+from http.server import BaseHTTPRequestHandler
 
 
-def decode_base64_image(encoded: str) -> bytes:
-    """Decode base64 string to bytes, removing data URL prefix if present."""
-    if ',' in encoded:
-        encoded = encoded.split(',', 1)[1]
-    return base64.b64decode(encoded)
+def encode_image_to_base64(image_bytes: bytes) -> str:
+    return base64.b64encode(image_bytes).decode('utf-8')
 
 
-def encode_image_to_base64(image_data: bytes) -> str:
-    """Encode image bytes to base64 data URL."""
-    return f"data:image/jpeg;base64,{base64.b64encode(image_data).decode('utf-8')}"
-
-
-async def analyze_page(image_base64: str, page_num: int, client: httpx.AsyncClient) -> dict:
-    """Analyze a single page using MiniMax vision API."""
-    api_key = os.environ.get('MINIMAX_API_KEY')
+def analyze_page_sync(image_b64: str, page_num: int) -> dict:
+    api_key = os.environ.get('MINIMAX_API_KEY', '')
     base_url = os.environ.get('MINIMAX_BASE_URL', 'https://api.minimaxi.com/anthropic')
     model = os.environ.get('MINIMAX_MODEL', 'MiniMax-M2.5')
 
-    prompt = f"""Analyze this picture book page (page {page_num + 1}).
-
-Provide a JSON response with the following structure:
+    prompt = f"""请分析这张绘本图片（第{page_num + 1}页），用中文返回以下JSON格式：
 {{
-    "narrator": "Narrator text (the main story text that describes the scene)",
+    "narrator": "旁白文字（描述场景的主要故事文字）",
     "dialogues": [
         {{
-            "character": "Character name or role",
-            "text": "What the character says",
-            "emotion": "Emotional tone (happy, sad, excited, surprised, angry, etc.)"
+            "character": "角色名称",
+            "text": "角色说的话",
+            "emotion": "情感（开心、悲伤、兴奋、惊讶、愤怒等）"
         }}
     ],
-    "scene_description": "Brief description of what's happening in this scene"
+    "scene_description": "场景简要描述"
 }}
-
-Focus on:
-- Extract any dialogue/speech from characters
-- Describe the overall scene
-- Identify characters and their emotions
-- Keep the narrator text as the main storytelling content
-
-Return ONLY valid JSON, no other text."""
+只返回JSON，不要其他文字。"""
 
     messages = [
         {
@@ -58,7 +41,7 @@ Return ONLY valid JSON, no other text."""
                     "source": {
                         "type": "base64",
                         "media_type": "image/jpeg",
-                        "data": image_base64
+                        "data": image_b64
                     }
                 },
                 {
@@ -69,148 +52,97 @@ Return ONLY valid JSON, no other text."""
         }
     ]
 
-    response = await client.post(
-        f"{base_url}/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": model,
-            "messages": messages,
-            "max_tokens": 2000
-        },
-        timeout=120.0
-    )
+    with httpx.Client(timeout=120.0) as client:
+        response = client.post(
+            f"{base_url}/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": model,
+                "max_tokens": 2000,
+                "messages": messages
+            }
+        )
+
+    print(f"[analyze] page {page_num}: status={response.status_code}", file=sys.stderr)
 
     if response.status_code != 200:
-        raise Exception(f"MiniMax API error: {response.status_code} - {response.text}")
+        print(f"[analyze] error: {response.text[:300]}", file=sys.stderr)
+        return {
+            "narrator": f"第{page_num+1}页",
+            "dialogues": [],
+            "scene_description": f"API错误: {response.status_code}"
+        }
 
     result = response.json()
-    content = result['choices'][0]['message']['content']
-
-    # Try to parse JSON from the response
-    try:
-        # Find JSON in the response
-        start_idx = content.find('{')
-        end_idx = content.rfind('}') + 1
-        if start_idx >= 0 and end_idx > start_idx:
-            json_str = content[start_idx:end_idx]
-            parsed = json.loads(json_str)
-            return parsed
-        else:
-            raise ValueError("No JSON found in response")
-    except (json.JSONDecodeError, ValueError) as e:
-        # Return a fallback structure if parsing fails
-        return {
-            "narrator": content[:500],
-            "dialogues": [],
-            "scene_description": "Analysis failed to parse"
-        }
-
-
-async def handler(request):
-    """Main handler for Vercel serverless function."""
-    if request.method != 'POST':
-        return {
-            "statusCode": 405,
-            "body": json.dumps({"error": "Method not allowed"})
-        }
+    content = result['content'][0]['text']
 
     try:
-        # Parse multipart form data
-        content_type = request.headers.get('content-type', '')
+        start = content.find('{')
+        end = content.rfind('}') + 1
+        if start >= 0 and end > start:
+            return json.loads(content[start:end])
+    except Exception as e:
+        print(f"[analyze] JSON parse error: {e}", file=sys.stderr)
 
-        if 'multipart/form-data' in content_type:
-            # Read the request body
-            body = request.get_body()
+    return {
+        "narrator": content[:500],
+        "dialogues": [],
+        "scene_description": "解析失败"
+    }
 
-            # Parse boundary from content-type
-            boundary_match = content_type.split('boundary=')
-            if len(boundary_match) > 1:
-                boundary = boundary_match[1].split(';')[0]
-            else:
-                return {
-                    "statusCode": 400,
-                    "body": json.dumps({"error": "No boundary found in content-type"})
-                }
 
-            # Parse multipart data manually
-            import re
-            parts = re.split(f'--{boundary}', body.decode('utf-8') if isinstance(body, bytes) else str(body))
+class handler(BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
 
-            images = []
-            for part in parts:
-                if 'Content-Type: image' in part or 'Content-Type: application/octet-stream' in part:
-                    # Extract filename to check if it's an image
-                    if 'filename=' in part:
-                        # Extract the binary data
-                        data_start = part.find('\r\n\r\n')
-                        if data_start >= 0:
-                            data = part[data_start + 4:]
-                            # Remove trailing boundary markers
-                            data = data.strip()
-                            if data:
-                                try:
-                                    # Try to decode as base64
-                                    decoded = base64.b64decode(data)
-                                    images.append(encode_image_to_base64(decoded))
-                                except:
-                                    pass
+    def do_POST(self):
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body)
+            images = data.get('images', [])
 
             if not images:
-                return {
-                    "statusCode": 400,
-                    "body": json.dumps({"error": "No images found in request"})
-                }
+                self._send_json(400, {"error": "No images provided", "success": False})
+                return
 
-        elif 'application/json' in content_type:
-            body = await request.json()
-            images = body.get('images', [])
-
-            if not images:
-                return {
-                    "statusCode": 400,
-                    "body": json.dumps({"error": "No images provided"})
-                }
-
-        else:
-            return {
-                "statusCode": 400,
-                "body": json.dumps({"error": "Unsupported content type"})
-            }
-
-        # Analyze each page
-        async with httpx.AsyncClient() as client:
             pages = []
             for i, image_data in enumerate(images):
-                # Ensure image is base64 encoded
-                if not image_data.startswith('data:'):
-                    image_data = encode_image_to_base64(image_data)
-
-                # Extract base64 data for API
+                # Strip data URL prefix if present
                 if ',' in image_data:
                     b64_data = image_data.split(',', 1)[1]
                 else:
                     b64_data = image_data
 
-                analysis = await analyze_page(b64_data, i, client)
-                pages.append(analysis)
+                page = analyze_page_sync(b64_data, i)
+                pages.append(page)
 
-        return {
-            "statusCode": 200,
-            "body": json.dumps({
+            self._send_json(200, {
                 "success": True,
                 "pages": pages,
                 "page_count": len(pages)
             })
-        }
 
-    except Exception as e:
-        return {
-            "statusCode": 500,
-            "body": json.dumps({
-                "error": str(e),
-                "success": False
-            })
-        }
+        except Exception as e:
+            print(f"[analyze] handler error: {e}", file=sys.stderr)
+            self._send_json(500, {"error": str(e), "success": False})
+
+    def _send_json(self, status, data):
+        body = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        print(f"[analyze] {format % args}", file=sys.stderr)
