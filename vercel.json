@@ -1,16 +1,11 @@
 {
   "version": 2,
   "functions": {
-    "api/*.py": {
-      "runtime": "python3.12"
-    },
-    "api/books/*.py": {
-      "runtime": "python3.12"
+    "api/**/*.py": {
+      "runtime": "@vercel/python@4.x"
     }
   },
   "rewrites": [
-    { "source": "/api/books/:path*", "destination": "/api/books/:path*" },
-    { "source": "/api/:path*", "destination": "/api/:path*" },
-    { "source": "/(.*)", "destination": "/index.html" }
+    { "source": "/((?!api/).*)", "destination": "/index.html" }
   ]
 }
