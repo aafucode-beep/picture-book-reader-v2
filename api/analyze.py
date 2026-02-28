@@ -75,7 +75,22 @@ def analyze_page_sync(image_b64: str, page_num: int, media_type: str = "image/jp
         }
 
     result = response.json()
-    content = result['content'][0]['text']
+    # MiniMax may return [{"type":"thinking",...}, {"type":"text",...}]
+    # Find the first content block with type=="text"
+    content_blocks = result.get('content', [])
+    content = None
+    for block in content_blocks:
+        if block.get('type') == 'text':
+            content = block.get('text', '')
+            break
+
+    if not content:
+        print(f"[analyze] no text block found, blocks: {[b.get('type') for b in content_blocks]}", file=sys.stderr)
+        return {
+            "narrator": f"第{page_num+1}页",
+            "dialogues": [],
+            "scene_description": "模型未返回文本"
+        }
 
     try:
         start = content.find('{')
