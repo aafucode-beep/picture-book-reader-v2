@@ -1,12 +1,5 @@
 {
   "version": 2,
-  "framework": "vite",
-  "functions": {
-    "api/**/*.py": {
-      "runtime": "python3.11",
-      "maxDuration": 300
-    }
-  },
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/$1" }
   ]
